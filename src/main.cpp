@@ -17,8 +17,8 @@
 // @HEADER
 
 // C++ core
-#include <iostream>
 #include <cmath>
+#include <iostream>
 
 // External
 #include <mpi.h>  // for MPI_Comm, MPI_Finalize, etc
@@ -31,6 +31,7 @@
 #include <stk_balance/balance.hpp>  // for stk::balance::balanceStkMesh
 #include <stk_io/StkMeshIoBroker.hpp>
 #include <stk_io/WriteMesh.hpp>
+#include <stk_mesh/base/DumpMeshInfo.hpp>  // for stk::mesh::impl::dump_all_mesh_info
 #include <stk_mesh/base/Field.hpp>
 #include <stk_mesh/base/GetNgpField.hpp>
 #include <stk_mesh/base/GetNgpMesh.hpp>
@@ -42,7 +43,6 @@
 #include <stk_topology/topology.hpp>       // stk::topology
 #include <stk_util/ngp/NgpSpaces.hpp>      // stk::ngp::ExecSpace, stk::ngp::RangePolicy
 #include <stk_util/parallel/Parallel.hpp>  // for stk::parallel_machine_init, stk::parallel_machine_finalize
-#include <stk_mesh/base/DumpMeshInfo.hpp>  // for stk::mesh::impl::dump_all_mesh_info
 
 // Mundy
 #include <mundy_core/throw_assert.hpp>     // for MUNDY_THROW_ASSERT
@@ -64,173 +64,236 @@ struct COORDS {};
 struct VEL {};
 struct FORCE {};
 
+struct SPRING_CONSTANT {};
+struct EQUILIBRIUM_DISTANCE {};
+
+// Class functor to run harmonic bond interactions
+// This is taken from will.cpp in mundy (effectively)...
+class eval_harmonic_bond {
+ public:
+  eval_harmonic_bond() {
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const auto& bonded_view) const {
+    auto r1 = get<COORDS>(bonded_view, 0);
+    auto r2 = get<COORDS>(bonded_view, 1);
+
+    double k_linear = get<SPRING_CONSTANT>(bonded_view)[0];
+    double r0 = get<EQUILIBRIUM_DISTANCE>(bonded_view)[0];
+
+    std::cout << "r1: " << r1 << std::endl;
+    std::cout << "r2: " << r2 << std::endl;
+    std::cout << "k_linear: " << k_linear << std::endl;
+    std::cout << "r0: " << r0 << std::endl;
+
+    // Calculate the distance vector
+    auto r21 = r2 - r1;
+    auto r21_length = math::norm(r21);
+    auto r21_hat = r21 / r21_length;
+    // Calculate the force for a linear spring
+    auto f1 = -k_linear * (r21_length - r0) * r21_hat;
+
+    // Update the force
+    // NOTE: Particle 2 above maps to particle 1 here, and Particle 1 above maps to 0.
+    // NOTE: XXX: This should actually be wrong, as there is a race condition due to different threads acting on nodes 0
+    // and 1 at the same time.
+    // get<FORCE>(bonded_view, 0) -= f1;
+    // get<FORCE>(bonded_view, 1) += f1;
+    // NOTE: XXX: The correct way of accessing the nodes via atomics is...
+    auto force1 = get<FORCE>(bonded_view, 0);
+    auto force2 = get<FORCE>(bonded_view, 1);
+    Kokkos::atomic_add(&force1[0], -f1[0]);
+    Kokkos::atomic_add(&force1[1], -f1[1]);
+    Kokkos::atomic_add(&force1[2], -f1[2]);
+    Kokkos::atomic_add(&force2[0], f1[0]);
+    Kokkos::atomic_add(&force2[1], f1[1]);
+    Kokkos::atomic_add(&force2[2], f1[2]);
+  }
+
+  void apply_to(auto& bonded_agg, const stk::mesh::Selector& subset_selector) {
+    static_assert(bonded_agg.topology() == stk::topology::BEAM_2, "BONDED must be beam 2 top.");
+
+    auto ngp_bonded_agg = mesh::get_updated_ngp_aggregate(bonded_agg);
+    ngp_bonded_agg.template sync_to_device<COORDS, FORCE, SPRING_CONSTANT, EQUILIBRIUM_DISTANCE>();
+    ngp_bonded_agg.template for_each((*this) /*use my operator as a lambda*/, subset_selector);
+    ngp_bonded_agg.template modify_on_device<FORCE>();
+  }
+
+  void apply_to(auto& bonded_agg) {
+    static_assert(bonded_agg.topology() == stk::topology::BEAM_2, "BONDED must be beam 2 top.");
+
+    auto ngp_bonded_agg = mesh::get_updated_ngp_aggregate(bonded_agg);
+    ngp_bonded_agg.template sync_to_device<COORDS, FORCE, SPRING_CONSTANT, EQUILIBRIUM_DISTANCE>();
+    ngp_bonded_agg.template for_each((*this) /*use my operator as a lambda*/);
+    ngp_bonded_agg.template modify_on_device<FORCE>();
+  }
+};
+
 void run_main() {
-    // STK usings
-    using stk::mesh::Field;
-    using stk::mesh::Part;
-    using stk::mesh::Entity;
-    using stk::mesh::Selector;
-    using stk::topology::ELEM_RANK;
-    using stk::topology::NODE_RANK;
+  // STK usings
+  using stk::mesh::Entity;
+  using stk::mesh::Field;
+  using stk::mesh::Part;
+  using stk::mesh::Selector;
+  using stk::topology::ELEM_RANK;
+  using stk::topology::NODE_RANK;
 
-    // Mundy things
-    using mesh::BulkData;
-    using mesh::DeclareEntitiesHelper;
-    using mesh::FieldComponent;
-    using mesh::LinkData;
-    using mesh::LinkMetaData;
-    using mesh::MeshBuilder;
-    using mesh::MetaData;
-    using mesh::QuaternionFieldComponent;
-    using mesh::ScalarFieldComponent;
-    using mesh::Vector3FieldComponent;
+  // Mundy things
+  using mesh::BulkData;
+  using mesh::DeclareEntitiesHelper;
+  using mesh::FieldComponent;
+  using mesh::LinkData;
+  using mesh::LinkMetaData;
+  using mesh::MeshBuilder;
+  using mesh::MetaData;
+  using mesh::QuaternionFieldComponent;
+  using mesh::ScalarFieldComponent;
+  using mesh::Vector3FieldComponent;
 
-    // Setup the STK mesh (boiler plate)
-    MeshBuilder mesh_builder(MPI_COMM_WORLD);
-    mesh_builder
-        .set_spatial_dimension(3)
-        .set_entity_rank_names({"NODE", "EDGE", "FACE", "ELEMENT", "CONSTRAINT"});
-    std::shared_ptr<MetaData> meta_data_ptr = mesh_builder.create_meta_data();
-    meta_data_ptr->use_simple_fields();
-    meta_data_ptr->set_coordinate_field_name("COORDS");
-    std::shared_ptr<BulkData> bulk_data_ptr = mesh_builder.create_bulk_data(meta_data_ptr);
-    MetaData& meta_data = *meta_data_ptr;
-    BulkData& bulk_data = *bulk_data_ptr;
+  // Setup the STK mesh (boiler plate)
+  MeshBuilder mesh_builder(MPI_COMM_WORLD);
+  mesh_builder.set_spatial_dimension(3).set_entity_rank_names({"NODE", "EDGE", "FACE", "ELEMENT", "CONSTRAINT"});
+  std::shared_ptr<MetaData> meta_data_ptr = mesh_builder.create_meta_data();
+  meta_data_ptr->use_simple_fields();
+  meta_data_ptr->set_coordinate_field_name("COORDS");
+  std::shared_ptr<BulkData> bulk_data_ptr = mesh_builder.create_bulk_data(meta_data_ptr);
+  MetaData& meta_data = *meta_data_ptr;
+  BulkData& bulk_data = *bulk_data_ptr;
 
-    // Setup the link data (boilerplate)
-    LinkMetaData link_meta_data = declare_link_meta_data(meta_data, "ALL_LINKS", NODE_RANK);
-    LinkData link_data = declare_link_data(bulk_data, link_meta_data);
+  // Setup the link data (boilerplate)
+  LinkMetaData link_meta_data = declare_link_meta_data(meta_data, "ALL_LINKS", NODE_RANK);
+  LinkData link_data = declare_link_data(bulk_data, link_meta_data);
 
-    // Declare Spheres
-    Part& sphere_part = meta_data.declare_part_with_topology("SPHERES", stk::topology::PARTICLE);
-    stk::io::put_io_part_attribute(sphere_part);
+  // Declare Spheres
+  Part& sphere_part = meta_data.declare_part_with_topology("SPHERES", stk::topology::PARTICLE);
+  stk::io::put_io_part_attribute(sphere_part);
 
-    // Declare Fields
-    auto &node_coords_field = meta_data.declare_field<double>(NODE_RANK, "COORDS");
-    auto &node_vel_field    = meta_data.declare_field<double>(NODE_RANK, "VEL");
-    auto &node_force_field  = meta_data.declare_field<double>(NODE_RANK, "FORCE");
+  // Declare bonded interactions as entities
+  Part& bonded_part = meta_data.declare_part_with_topology("BONDED", stk::topology::BEAM_2);
+  stk::io::put_io_part_attribute(bonded_part);
 
-    // Put fields on mesh
-    stk::mesh::put_field_on_mesh(node_coords_field, meta_data.universal_part(), 3, nullptr);
-    stk::mesh::put_field_on_mesh(node_vel_field,    meta_data.universal_part(), 3, nullptr);
-    stk::mesh::put_field_on_mesh(node_force_field,  meta_data.universal_part(), 3, nullptr);
+  // Declare Fields
+  auto& node_coords_field = meta_data.declare_field<double>(NODE_RANK, "COORDS");
+  auto& node_vel_field = meta_data.declare_field<double>(NODE_RANK, "VEL");
+  auto& node_force_field = meta_data.declare_field<double>(NODE_RANK, "FORCE");
 
-    // Setup io on fields
-    auto transient_role   = Ioss::Field::TRANSIENT;
-    auto vector_3d_io_type = stk::io::FieldOutputType::VECTOR_3D;
-    stk::io::set_field_role(node_vel_field,   transient_role);
-    stk::io::set_field_output_type(node_vel_field,   vector_3d_io_type);
-    stk::io::set_field_role(node_force_field, transient_role);
-    stk::io::set_field_output_type(node_force_field, vector_3d_io_type);
+  auto& elem_spring_constant_field = meta_data.declare_field<double>(ELEM_RANK, "SPRING_CONSTANT");
+  auto& elem_equilibrium_distance_field = meta_data.declare_field<double>(ELEM_RANK, "EQUILIBRIUM_DISTANCE");
 
-    // Commit the mesh
-    meta_data.commit();
+  // Put fields on mesh
+  stk::mesh::put_field_on_mesh(node_coords_field, meta_data.universal_part(), 3, nullptr);
+  stk::mesh::put_field_on_mesh(node_vel_field, meta_data.universal_part(), 3, nullptr);
+  stk::mesh::put_field_on_mesh(node_force_field, meta_data.universal_part(), 3, nullptr);
 
-    // Build our accessors and aggregates
-    auto node_coords_accessor = Vector3FieldComponent(node_coords_field);
-    auto node_vel_accessor    = Vector3FieldComponent(node_vel_field);
-    auto node_force_accessor  = Vector3FieldComponent(node_force_field);
+  stk::mesh::put_field_on_mesh(elem_spring_constant_field, bonded_part, 1, nullptr);
+  stk::mesh::put_field_on_mesh(elem_equilibrium_distance_field, bonded_part, 1, nullptr);
 
-    auto sphere_agg = make_aggregate<stk::topology::PARTICLE>(bulk_data, sphere_part)
-      .add_component<COORDS,NODE_RANK>(node_coords_accessor)
-      .add_component<VEL,  NODE_RANK>(node_vel_accessor)
-      .add_component<FORCE,NODE_RANK>(node_force_accessor);
+  // Setup io on fields
+  auto transient_role = Ioss::Field::TRANSIENT;
+  auto vector_3d_io_type = stk::io::FieldOutputType::VECTOR_3D;
+  stk::io::set_field_role(node_vel_field, transient_role);
+  stk::io::set_field_output_type(node_vel_field, vector_3d_io_type);
+  stk::io::set_field_role(node_force_field, transient_role);
+  stk::io::set_field_output_type(node_force_field, vector_3d_io_type);
 
-    // Create entities
-    DeclareEntitiesHelper dec_helper;
+  stk::io::set_field_role(elem_spring_constant_field, transient_role);
+  stk::io::set_field_output_type(elem_spring_constant_field, stk::io::FieldOutputType::SCALAR);
 
-    dec_helper.create_node()
-          .owning_proc(0)
-          .id(1)
-          .add_field_data<double>(&node_coords_field, {0.0, 0.0, 0.0})
-          .add_field_data<double>(&node_vel_field,    {0.0, 0.0, 0.0})
-          .add_field_data<double>(&node_force_field,  {0.0, 0.0, 0.0});
+  // Commit the mesh
+  meta_data.commit();
 
-    dec_helper.create_node()
-          .owning_proc(0)
-          .id(2)
-          .add_field_data<double>(&node_coords_field, {1.0, 2.0, 3.0})
-          .add_field_data<double>(&node_vel_field,    {0.0, 0.0, 0.0})
-          .add_field_data<double>(&node_force_field,  {0.0, 0.0, 0.0});
+  // Build our accessors and aggregates
+  auto node_coords_accessor = Vector3FieldComponent(node_coords_field);
+  auto node_vel_accessor = Vector3FieldComponent(node_vel_field);
+  auto node_force_accessor = Vector3FieldComponent(node_force_field);
 
-    // Declare the entities
-    dec_helper.check_consistency(bulk_data);
-    bulk_data.modification_begin();
-    dec_helper.declare_entities(bulk_data);
-    bulk_data.modification_end();
+  auto elem_spring_constant_accessor = ScalarFieldComponent(elem_spring_constant_field);
+  auto elem_equilibrium_distance_accessor = ScalarFieldComponent(elem_equilibrium_distance_field);
 
-    // Compute rest‐length and spring constant
-    auto* c1 = stk::mesh::field_data(node_coords_field,
-                  bulk_data.get_entity(NODE_RANK, 1));
-    auto* c2 = stk::mesh::field_data(node_coords_field,
-                  bulk_data.get_entity(NODE_RANK, 2));
-    double dx = c2[0] - c1[0];
-    double dy = c2[1] - c1[1];
-    double dz = c2[2] - c1[2];
-    double L0 = std::sqrt(dx*dx + dy*dy + dz*dz);
-    double k_spring = 100.0;
+  auto sphere_agg = make_aggregate<stk::topology::PARTICLE>(bulk_data, sphere_part)
+                        .add_component<COORDS, NODE_RANK>(node_coords_accessor)
+                        .add_component<VEL, NODE_RANK>(node_vel_accessor)
+                        .add_component<FORCE, NODE_RANK>(node_force_accessor);
 
-    // Single pass: zero + harmonic spring
-    stk::mesh::Entity n1 = bulk_data.get_entity(NODE_RANK, 1);
-    stk::mesh::Entity n2 = bulk_data.get_entity(NODE_RANK, 2);
+  auto bonded_agg = make_aggregate<stk::topology::BEAM_2>(bulk_data, bonded_part)
+                        .add_component<COORDS, NODE_RANK>(node_coords_accessor)
+                        .add_component<FORCE, NODE_RANK>(node_force_accessor)
+                        .add_component<SPRING_CONSTANT, ELEM_RANK>(elem_spring_constant_accessor)
+                        .add_component<EQUILIBRIUM_DISTANCE, ELEM_RANK>(elem_equilibrium_distance_accessor);
 
-    bulk_data.modification_begin();
-    for (auto *bucket : bulk_data.buckets(NODE_RANK)) {
-        for (size_t i = 0; i < bucket->size(); ++i) {
-            stk::mesh::Entity ent = (*bucket)[i];
-            double* f = stk::mesh::field_data(node_force_field, ent);
+  // Create entities
+  DeclareEntitiesHelper dec_helper;
 
-            // zero force
-            f[0] = f[1] = f[2] = 0.0;
+  // Creating the two endpoint nodes in the elastic network
+  dec_helper.create_node()
+      .owning_proc(0)
+      .id(1)
+      .add_field_data<double>(&node_coords_field, {0.0, 0.0, 0.0})
+      .add_field_data<double>(&node_vel_field, {0.0, 0.0, 0.0})
+      .add_field_data<double>(&node_force_field, {0.0, 0.0, 0.0});
 
-            // apply spring on nodes 1 & 2
-            if (ent == n1 || ent == n2) {
-                double* c_this  = stk::mesh::field_data(node_coords_field, ent);
-                double* c_other = stk::mesh::field_data(
-                                      node_coords_field,
-                                      (ent==n1 ? n2 : n1)
-                                  );
-                double dx_ = c_other[0] - c_this[0];
-                double dy_ = c_other[1] - c_this[1];
-                double dz_ = c_other[2] - c_this[2];
-                double r   = std::sqrt(dx_*dx_ + dy_*dy_ + dz_*dz_);
+  dec_helper.create_node()
+      .owning_proc(0)
+      .id(2)
+      .add_field_data<double>(&node_coords_field, {1.1, 0.0, 0.0})
+      .add_field_data<double>(&node_vel_field, {0.0, 0.0, 0.0})
+      .add_field_data<double>(&node_force_field, {0.0, 0.0, 0.0});
 
-                double fmag = -k_spring * (r - L0);
-                double ux   = dx_ / r;
-                double uy   = dy_ / r;
-                double uz   = dz_ / r;
+  dec_helper.create_node()
+      .owning_proc(0)
+      .id(3)
+      .add_field_data<double>(&node_coords_field, {2.1, 0.0, 0.0})
+      .add_field_data<double>(&node_vel_field, {0.0, 0.0, 0.0})
+      .add_field_data<double>(&node_force_field, {0.0, 0.0, 0.0});
 
-                if (ent == n1) {
-                    f[0] += fmag * ux;
-                    f[1] += fmag * uy;
-                    f[2] += fmag * uz;
-                } else {
-                    f[0] -= fmag * ux;
-                    f[1] -= fmag * uy;
-                    f[2] -= fmag * uz;
-                }
-            }
-        }
-    }
-    bulk_data.modification_end();
+  // Declare a bonded interaction between the nodes
+  dec_helper.create_element()
+      .owning_proc(0)
+      .id(1)
+      .topology(stk::topology::BEAM_2)
+      .add_part(&bonded_part)
+      .nodes({1, 2})
+      .add_field_data<double>(&elem_spring_constant_field, {1.0})
+      .add_field_data<double>(&elem_equilibrium_distance_field, {1.0});
+  dec_helper.create_element()
+      .owning_proc(0)
+      .id(2)
+      .topology(stk::topology::BEAM_2)
+      .add_part(&bonded_part)
+      .nodes({2, 3})
+      .add_field_data<double>(&elem_spring_constant_field, {3.14})
+      .add_field_data<double>(&elem_equilibrium_distance_field, {1.0});
 
-    // XXX Dump all of the mesh info
-    stk::mesh::impl::dump_all_mesh_info(bulk_data, std::cout);
+  // Declare the entities
+  dec_helper.check_consistency(bulk_data);
+  bulk_data.modification_begin();
+  dec_helper.declare_entities(bulk_data);
+  bulk_data.modification_end();
+
+  // XXX Dump all of the mesh info
+  //   stk::mesh::impl::dump_all_mesh_info(bulk_data, std::cout);
+
+  // Test run of the evaluate functor
+  eval_harmonic_bond().apply_to(bonded_agg);
+
+  // XXX Dump all of the mesh info after calculating forces!
+  stk::mesh::impl::dump_all_mesh_info(bulk_data, std::cout);
 }
 
-} // namespace mundy
+}  // namespace mundy
 
 int main(int argc, char** argv) {
-    // Initialize MPI
-    stk::parallel_machine_init(&argc, &argv);
-    Kokkos::initialize(argc, argv);
-    Kokkos::print_configuration(std::cout);
+  // Initialize MPI
+  stk::parallel_machine_init(&argc, &argv);
+  Kokkos::initialize(argc, argv);
+  Kokkos::print_configuration(std::cout);
 
-    mundy::run_main();
+  mundy::run_main();
 
-    // Finalize MPI
-    Kokkos::finalize();
-    stk::parallel_machine_finalize();
+  // Finalize MPI
+  Kokkos::finalize();
+  stk::parallel_machine_finalize();
 
-    return 0;
+  return 0;
 }
